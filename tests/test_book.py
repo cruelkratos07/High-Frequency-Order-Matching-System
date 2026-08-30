@@ -2,7 +2,7 @@ import random
 
 import pytest
 
-from engine import Fenwick, Order, OrderBook, Side
+from engine import Fenwick, Order, OrderBook, OrderType, Side
 
 
 @pytest.fixture
@@ -193,3 +193,90 @@ def test_market_never_crosses(book):
                           random.randint(95, 105), random.randint(1, 10)))
         if book.best_bid is not None and book.best_ask is not None:
             assert book.best_bid < book.best_ask
+
+
+# ---------- order types ----------
+
+@pytest.fixture
+def loaded(book):
+    """Asks resting at 100, 101, 102 with 10 each."""
+    for i, p in enumerate((100, 101, 102)):
+        book.submit(Order(f"s{i}", Side.SELL, p, 10))
+    return book
+
+
+def test_market_order_walks_the_book(loaded):
+    trades = loaded.submit(Order("m", Side.BUY, None, 25, OrderType.MARKET))
+    assert [(t.price, t.quantity) for t in trades] == [(100, 10), (101, 10), (102, 5)]
+
+
+def test_market_order_ignores_price_argument(loaded):
+    """A price passed to a MARKET order is discarded, not used as a limit."""
+    order = Order("m", Side.BUY, 100, 25, OrderType.MARKET)
+    assert order.price is None
+    assert sum(t.quantity for t in loaded.submit(order)) == 25
+
+
+def test_market_order_discards_unfilled_remainder(loaded):
+    trades = loaded.submit(Order("m", Side.BUY, None, 100, OrderType.MARKET))
+    assert sum(t.quantity for t in trades) == 30
+    assert loaded.open_order_count == 0
+    assert loaded.best_bid is None
+
+
+def test_market_order_on_empty_book_does_nothing(book):
+    assert book.submit(Order("m", Side.BUY, None, 10, OrderType.MARKET)) == []
+    assert book.open_order_count == 0
+
+
+def test_ioc_fills_what_it_can_and_cancels_the_rest(loaded):
+    trades = loaded.submit(Order("i", Side.BUY, 101, 25, OrderType.IOC))
+    assert sum(t.quantity for t in trades) == 20
+    assert loaded.open_order_count == 1      # only the untouched 102 level
+    assert loaded.best_bid is None
+
+
+def test_ioc_respects_its_limit_price(loaded):
+    trades = loaded.submit(Order("i", Side.BUY, 100, 30, OrderType.IOC))
+    assert sum(t.quantity for t in trades) == 10
+
+
+def test_fok_rejected_leaves_book_untouched(loaded):
+    before = loaded.snapshot()
+    assert loaded.submit(Order("f", Side.BUY, 101, 25, OrderType.FOK)) == []
+    assert loaded.snapshot() == before
+    assert loaded.open_order_count == 3
+
+
+def test_fok_fills_when_exactly_enough_liquidity(loaded):
+    trades = loaded.submit(Order("f", Side.BUY, 101, 20, OrderType.FOK))
+    assert sum(t.quantity for t in trades) == 20
+    assert loaded.open_order_count == 1
+
+
+def test_fok_never_rests(loaded):
+    loaded.submit(Order("f", Side.BUY, 102, 30, OrderType.FOK))
+    assert loaded.best_bid is None
+
+
+def test_rejected_fok_id_is_reusable(loaded):
+    """A rejected order was never registered, so its id is still free."""
+    assert loaded.submit(Order("f", Side.BUY, 101, 25, OrderType.FOK)) == []
+    assert sum(t.quantity for t in loaded.submit(
+        Order("f", Side.BUY, 101, 20, OrderType.FOK))) == 20
+
+
+def test_available_against_matches_actual_fill(loaded):
+    order = Order("probe", Side.BUY, 101, 999, OrderType.IOC)
+    predicted = loaded.available_against(order)
+    assert sum(t.quantity for t in loaded.submit(order)) == predicted
+
+
+def test_limit_order_still_rests(loaded):
+    loaded.submit(Order("l", Side.BUY, 99, 10))
+    assert loaded.best_bid == 99
+
+
+def test_non_market_order_requires_a_price():
+    with pytest.raises(ValueError):
+        Order("bad", Side.BUY, None, 10, OrderType.IOC)

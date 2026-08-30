@@ -3,7 +3,7 @@ from collections import OrderedDict
 from sortedcontainers import SortedDict
 
 from .fenwick import Fenwick
-from .orders import Order, Side, Trade
+from .orders import Order, OrderType, Side, Trade
 
 
 class Level(OrderedDict):
@@ -57,17 +57,44 @@ class OrderBook:
     def open_order_count(self):
         return len(self._orders)
 
+    def available_against(self, order):
+        """Quantity this order could fill against the book right now.
+
+        Uses the liquidity index rather than walking levels, so the FOK
+        feasibility check below is O(log N) instead of O(levels).
+        """
+        other = Side.SELL if order.side is Side.BUY else Side.BUY
+        index = self._liquidity[other]
+        if order.price is None:
+            return index.total()
+        if order.side is Side.BUY:
+            return index.range_sum(index.min_price, order.price)
+        return index.range_sum(order.price, index.max_price)
+
     def submit(self, order):
-        """Match against the opposite side, rest any remainder. Returns trades."""
+        """Match against the opposite side, then handle the remainder by type.
+
+        LIMIT rests it, MARKET and IOC discard it, FOK never gets here unless
+        the whole quantity can fill.
+        """
         if order.order_id in self._orders:
             raise ValueError(f"duplicate order_id: {order.order_id}")
         if order.quantity <= 0:
             raise ValueError("quantity must be positive")
 
+        # All-or-nothing: check before touching the book, so a rejected FOK
+        # leaves no trace.
+        if order.type is OrderType.FOK and self.available_against(order) < order.quantity:
+            return []
+
         trades = []
         book = self._book(Side.SELL if order.side is Side.BUY else Side.BUY)
-        crosses = ((lambda p: order.price >= p) if order.side is Side.BUY
-                   else (lambda p: order.price <= p))
+        if order.price is None:
+            crosses = lambda p: True          # MARKET takes any price
+        elif order.side is Side.BUY:
+            crosses = lambda p: order.price >= p
+        else:
+            crosses = lambda p: order.price <= p
 
         while order.quantity and book:
             key, level = book.peekitem(0)
@@ -94,7 +121,7 @@ class OrderBook:
             if not level:
                 del book[key]
 
-        if order.quantity:
+        if order.quantity and order.type is OrderType.LIMIT:
             self._rest(order)
         return trades
 

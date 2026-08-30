@@ -7,12 +7,26 @@ class Side(Enum):
     SELL = "SELL"
 
 
+class OrderType(Enum):
+    LIMIT = "LIMIT"    # rest whatever doesn't fill
+    MARKET = "MARKET"  # take any price, cancel what doesn't fill
+    IOC = "IOC"        # immediate-or-cancel: fill now, cancel the rest
+    FOK = "FOK"        # fill-or-kill: fill completely or do nothing
+
+
 @dataclass
 class Order:
     order_id: str
     side: Side
-    price: int  # integer ticks - float prices break cross detection
+    price: int | None  # integer ticks; None for MARKET
     quantity: int
+    type: OrderType = OrderType.LIMIT
+
+    def __post_init__(self):
+        if self.type is OrderType.MARKET:
+            self.price = None
+        elif self.price is None:
+            raise ValueError(f"{self.type.value} orders need a price")
 
 
 @dataclass(frozen=True)

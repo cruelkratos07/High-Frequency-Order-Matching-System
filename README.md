@@ -21,7 +21,20 @@ Prices are integer ticks. Float prices break cross detection.
 
 Better price wins; at equal price, earlier arrival wins. Trades execute at the
 **resting** order's price, so price improvement goes to the aggressor, as on a
-real exchange. Unfilled remainder rests.
+real exchange.
+
+## Order types
+
+| Type | Crosses at | Unfilled remainder |
+|---|---|---|
+| `LIMIT` | its limit price | rests on the book |
+| `MARKET` | any price | discarded |
+| `IOC` | its limit price | discarded |
+| `FOK` | its limit price | rejected outright unless the whole quantity fills |
+
+FOK checks feasibility through the liquidity index before touching the book, so
+a rejected order is O(log N) and leaves no trace — no partial fills to unwind.
+This is the second thing the Fenwick tree buys beyond range queries.
 
 ## Liquidity index
 
@@ -34,29 +47,30 @@ updates.
 
 ## Performance
 
-CPython, single-threaded. `python benchmark.py`.
+CPython 3.13 on Windows, single-threaded. Reproduce with `python benchmark.py`.
 
-| Operation | p50 | p90 | p99 |
-|---|---|---|---|
-| submit (rest) | 3.68 us | 5.08 us | 16.12 us |
-| submit (matching) | 8.10 us | 12.31 us | 24.48 us |
-| cancel | 2.80 us | 3.39 us | 5.54 us |
-| liquidity query, Fenwick | 1.73 us | 1.99 us | 4.66 us |
-| liquidity query, level scan | 23.29 us | 27.94 us | 45.17 us |
+| Operation | p50 | p90 | p99 | p99.9 |
+|---|---|---|---|---|
+| submit (rest) | 5.60 us | 7.70 us | 13.70 us | 92.20 us |
+| submit (matching) | 8.80 us | 18.60 us | 24.30 us | 115.00 us |
+| cancel | 4.30 us | 5.10 us | 7.40 us | 43.30 us |
+| liquidity query, Fenwick | 2.80 us | 3.30 us | 4.00 us | 17.40 us |
+| liquidity query, level scan | 47.10 us | 87.40 us | 196.60 us | 421.50 us |
 
 ### Fenwick vs level scan, by query width
 
 | Price levels | Fenwick | Scan | Speedup |
 |---|---|---|---|
-| 10 | 1.86 us | 2.82 us | 1.5x |
-| 50 | 1.62 us | 12.10 us | 7.5x |
-| 100 | 1.50 us | 23.79 us | 15.9x |
-| 250 | 1.71 us | 59.11 us | 34.6x |
-| 500 | 1.47 us | 115.77 us | 78.9x |
-| 1000 | 1.49 us | 249.68 us | 167.8x |
+| 10 | 2.84 us | 4.22 us | 1.5x |
+| 50 | 2.64 us | 25.24 us | 9.6x |
+| 100 | 4.35 us | 74.94 us | 17.2x |
+| 250 | 5.40 us | 228.25 us | 42.3x |
+| 500 | 5.47 us | 438.76 us | 80.2x |
+| 1000 | 5.23 us | 840.30 us | 160.7x |
 
-The tree stays flat; the scan grows linearly. **Crossover is around 5-10
-levels** — below that the index costs more in updates than it saves.
+The scan grows linearly with the range; the tree barely moves. **Crossover is
+around 10 levels** — below that the index costs more to maintain than it saves,
+and a narrow query should just walk the levels.
 
 These are CPython numbers on a general-purpose machine. They measure
 algorithmic behaviour, not production low-latency performance.
@@ -64,7 +78,7 @@ algorithmic behaviour, not production low-latency performance.
 ## Tests
 
 ```bash
-python -m pytest tests/ -q      # 26 tests
+python -m pytest tests/ -q      # 57 tests
 ```
 
 Two randomised invariants beyond the unit tests:
@@ -95,19 +109,43 @@ book.liquidity_between(Side.SELL, 100, 105)
 book.cancel("a2")
 ```
 
+## WebSocket gateway
+
+`python gateway.py` serves order entry and L2 market data on
+`ws://localhost:8765`, line-delimited JSON. Every mutation broadcasts a fresh
+book snapshot to all connected clients.
+
+```jsonc
+// client -> server
+{"action": "submit", "id": "o1", "side": "BUY", "price": 100, "quantity": 10, "type": "LIMIT"}
+{"action": "cancel", "id": "o1"}
+{"action": "snapshot"}
+
+// server -> client
+{"type": "ack", "order_id": "o1", "trades": [...], "resting": true}
+{"type": "book", "bids": [[100, 10]], "asks": [[101, 5]], "best_bid": 100, ...}
+{"type": "error", "message": "..."}
+```
+
+One asyncio task per connection, all sharing one book. The book is synchronous
+and there is no await inside the matching path, so `submit` and `cancel` are
+effectively atomic under asyncio's single-threaded scheduling — no locking
+needed, and none should be added without auditing that path first.
+
 ## Layout
 
 ```
-engine/orders.py    Order, Trade, Side
+engine/orders.py    Order, Trade, Side, OrderType
 engine/fenwick.py   Fenwick tree over the price grid
 engine/book.py      OrderBook: matching, cancellation, liquidity
+gateway.py          asyncio WebSocket server
 tests/test_book.py
+tests/test_gateway.py
 benchmark.py
 ```
 
 ## Todo
 
-- Market, IOC and FOK order types
-- WebSocket gateway for L2 market data
 - Multi-symbol books
 - Event journal and snapshot/restore
+- Stop and iceberg order types
